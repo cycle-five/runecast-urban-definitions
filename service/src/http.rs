@@ -31,11 +31,18 @@ pub const FINISHED_KEEP_SECS: i64 = 600;
 /// byte over `CHUNK_SIZE` reaches the handler and gets `chunk_too_large`.
 const CHUNK_BODY_LIMIT: usize = CHUNK_SIZE as usize + (1 << 20);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Finished {
+    /// The hash matched; the unlock relay is still running.
+    Pending,
     Done(UploadOutcome),
     WrongFile,
 }
+
+/// How long a re-send or poll waits for a pending match (the relay's worst
+/// case is about 17 s).
+const PENDING_WAIT: Duration = Duration::from_secs(30);
+const PENDING_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -76,7 +83,9 @@ impl AppState {
 
     /// Expires idle uploads and old finished records. Run every 30 s.
     pub fn sweep(&self) {
-        self.uploads.sweep();
+        for _ in 0..self.uploads.sweep() {
+            m::upload("abandoned");
+        }
         let cutoff = self.clock.now_unix() - FINISHED_KEEP_SECS;
         self.finished
             .lock()
@@ -98,6 +107,21 @@ impl AppState {
             .expect("finished lock poisoned")
             .get(id)
             .map(|(_, f)| *f)
+    }
+
+    /// The final answer for `id` if there is one; a pending match is waited
+    /// out (bounded), so the caller never sees a half-finished upload.
+    async fn settled(&self, id: &str) -> Option<Finished> {
+        let deadline = tokio::time::Instant::now() + PENDING_WAIT;
+        loop {
+            match self.recorded(id) {
+                Some(Finished::Pending) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(PENDING_POLL).await;
+                }
+                Some(Finished::Pending) => return None,
+                other => return other,
+            }
+        }
     }
 }
 
@@ -160,13 +184,14 @@ async fn start_upload(State(s): State<AppState>, Json(req): Json<StartUpload>) -
 
 fn finished_response(f: Finished) -> Response {
     match f {
+        Finished::Pending => error(ErrorCode::Unavailable),
         Finished::Done(outcome) => Json(ChunkResponse::Finished { outcome }).into_response(),
         Finished::WrongFile => error(ErrorCode::WrongFile),
     }
 }
 
 async fn progress(State(s): State<AppState>, Path(id): Path<String>) -> Response {
-    if let Some(f) = s.recorded(&id) {
+    if let Some(f) = s.settled(&id).await {
         return finished_response(f);
     }
     match s.uploads.progress(&id) {
@@ -176,11 +201,10 @@ async fn progress(State(s): State<AppState>, Path(id): Path<String>) -> Response
 }
 
 async fn cancel(State(s): State<AppState>, Path(id): Path<String>) -> StatusCode {
-    if s.uploads.progress(&id).is_ok() {
+    if s.uploads.cancel(&id) {
         m::upload("abandoned");
         tracing::info!(upload_id = %id, "upload cancelled by the player");
     }
-    s.uploads.cancel(&id);
     StatusCode::NO_CONTENT
 }
 
@@ -189,11 +213,24 @@ async fn chunk(
     Path((id, offset)): Path<(String, u64)>,
     body: axum::body::Bytes,
 ) -> Response {
-    // A re-sent final chunk (lost response) gets the recorded answer; the
-    // unlock relay never runs twice.
-    if let Some(f) = s.recorded(&id) {
+    // Run to completion even if the client disconnects: a dropped request
+    // must not skip the unlock, the metrics or the final-answer record.
+    match tokio::spawn(process_chunk(s, id.clone(), offset, body)).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!(upload_id = %id, error = %e, "chunk task failed");
+            error(ErrorCode::Unavailable)
+        }
+    }
+}
+
+async fn process_chunk(s: AppState, id: String, offset: u64, body: axum::body::Bytes) -> Response {
+    // A re-sent final chunk (lost response) gets the recorded answer, waiting
+    // for a match still in flight; the unlock relay never runs twice.
+    if let Some(f) = s.settled(&id).await {
         return finished_response(f);
     }
+    let user_id = s.uploads.user_of(&id);
     let uploads = s.uploads.clone();
     let upload_id = id.clone();
     let step =
@@ -207,6 +244,9 @@ async fn chunk(
     match step {
         Ok(ChunkStep::Progress(p)) => Json(ChunkResponse::Progress(p)).into_response(),
         Ok(ChunkStep::Matched { user_id, loaded }) => {
+            // No await between the upload leaving the table and this record,
+            // so a concurrent re-send finds Pending, not NotFound.
+            s.record(&id, Finished::Pending);
             let unlocked = unlock_with_retry(&*s.relay, user_id, s.retry_delay).await;
             let (outcome, label) = match (unlocked, loaded) {
                 (false, _) => (UploadOutcome::UnlockFailed, "unlock_failed"),
@@ -228,11 +268,11 @@ async fn chunk(
         Err(code) => {
             if code == ErrorCode::WrongFile {
                 m::upload("wrong_file");
-                tracing::info!(upload_id = %id, "upload finished: wrong file");
+                tracing::info!(?user_id, upload_id = %id, "upload finished: wrong file");
                 s.record(&id, Finished::WrongFile);
             } else if code == ErrorCode::NotFound {
                 // Lost the race with a concurrent final chunk.
-                if let Some(f) = s.recorded(&id) {
+                if let Some(f) = s.settled(&id).await {
                     return finished_response(f);
                 }
             }

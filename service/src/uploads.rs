@@ -76,11 +76,13 @@ struct Inner {
 }
 
 impl Inner {
-    fn remove(&mut self, id: &str) {
-        self.uploads.remove(id);
+    /// True when an upload with that id existed.
+    fn remove(&mut self, id: &str) -> bool {
+        let existed = self.uploads.remove(id).is_some();
         if self.load_slot.as_deref() == Some(id) {
             self.load_slot = None;
         }
+        existed
     }
 }
 
@@ -279,13 +281,20 @@ impl Uploads {
         })
     }
 
-    pub fn cancel(&self, upload_id: &str) {
-        self.lock().remove(upload_id);
+    /// True when this call removed a live upload.
+    pub fn cancel(&self, upload_id: &str) -> bool {
+        self.lock().remove(upload_id)
+    }
+
+    /// The player an in-flight upload belongs to.
+    pub fn user_of(&self, upload_id: &str) -> Option<i64> {
+        self.lock().uploads.get(upload_id).map(|e| e.user_id)
     }
 
     /// Drops idle uploads (freeing the load slot) and nonces whose tickets
-    /// have expired anyway. Called by the server every 30 s.
-    pub fn sweep(&self) {
+    /// have expired anyway. Called by the server every 30 s. Returns how many
+    /// idle uploads it dropped.
+    pub fn sweep(&self) -> usize {
         let now = self.clock.now_unix();
         let mut inner = self.lock();
         let idle: Vec<String> = inner
@@ -299,10 +308,12 @@ impl Uploads {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        let dropped = idle.len();
         for id in idle {
             inner.remove(&id);
         }
         inner.used_nonces.retain(|_, expires_at| *expires_at > now);
+        dropped
     }
 
     #[cfg(test)]
@@ -592,7 +603,8 @@ mod tests {
         let a = start_as(&r, 1, "a").unwrap();
         r.up.chunk(&a.upload_id, 0, &FIXTURE[..10]).unwrap();
         r.clock.0.fetch_add(601, Ordering::SeqCst);
-        r.up.sweep();
+        assert_eq!(r.up.sweep(), 1);
+        assert_eq!(r.up.sweep(), 0);
         assert_eq!(
             r.up.progress(&a.upload_id).unwrap_err(),
             ErrorCode::NotFound
@@ -604,6 +616,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b.mode, UploadMode::Load);
+    }
+
+    #[test]
+    fn cancel_and_user_of_report_what_they_found() {
+        let r = rig();
+        let a = start_as(&r, 7, "a").unwrap();
+        assert_eq!(r.up.user_of(&a.upload_id), Some(7));
+        assert!(r.up.cancel(&a.upload_id));
+        assert!(!r.up.cancel(&a.upload_id));
+        assert_eq!(r.up.user_of(&a.upload_id), None);
     }
 
     #[test]

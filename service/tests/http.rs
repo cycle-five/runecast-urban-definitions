@@ -29,12 +29,14 @@ const FIXTURE: &[u8] = include_bytes!("fixtures/mini.ndjson");
 struct FakeRelay {
     calls: Mutex<Vec<i64>>,
     fail: bool,
+    delay: Duration,
 }
 
 #[async_trait]
 impl UnlockRelay for FakeRelay {
     async fn unlock(&self, user_id: i64) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(user_id);
+        tokio::time::sleep(self.delay).await;
         if self.fail {
             anyhow::bail!("backend unreachable");
         }
@@ -61,6 +63,10 @@ struct Rig {
 }
 
 fn rig(fail: bool) -> Rig {
+    rig_with(fail, Duration::ZERO)
+}
+
+fn rig_with(fail: bool, delay: Duration) -> Rig {
     let store = Arc::new(Definitions::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let uploads = Arc::new(Uploads::new(
@@ -74,6 +80,7 @@ fn rig(fail: bool) -> Rig {
     ));
     let relay = Arc::new(FakeRelay {
         fail,
+        delay,
         ..Default::default()
     });
     let mut state = AppState::new(
@@ -429,4 +436,47 @@ async fn metrics_need_the_bearer() {
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("urban_definitions_loaded"), "{text}");
     assert!(text.contains("urban_definitions_uploads_total"), "{text}");
+}
+
+#[tokio::test]
+async fn a_resend_during_a_slow_unlock_waits_for_the_same_answer() {
+    let r = rig_with(false, Duration::from_millis(300));
+    let up = start(&r.app, 42, "n1").await;
+    let first = tokio::spawn({
+        let app = r.app.clone();
+        let id = up.upload_id.clone();
+        async move { send(&app, put_chunk(&id, 0, FIXTURE.to_vec())).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Mid-unlock: both a re-send and a poll wait, then see the final answer.
+    let (s2, again) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
+    let uri = format!("/urban-definitions/uploads/{}", up.upload_id);
+    let (s3, polled) = send(&r.app, get(&uri, None)).await;
+    let (s1, original) = first.await.unwrap();
+    let expect = r#"{"status":"finished","outcome":"loaded"}"#;
+    for (status, body) in [(s1, original), (s2, again), (s3, polled)] {
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8(body).unwrap(), expect);
+    }
+    assert_eq!(r.relay.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_dropped_request_still_finishes_the_unlock_and_records_the_answer() {
+    let r = rig_with(false, Duration::from_millis(200));
+    let up = start(&r.app, 42, "n1").await;
+    // The client gives up long before the relay answers.
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(50),
+        send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())),
+    )
+    .await;
+    assert!(abandoned.is_err(), "request should have been cut short");
+    let (status, body) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"status":"finished","outcome":"loaded"}"#
+    );
+    assert_eq!(*r.relay.calls.lock().unwrap(), vec![42]);
 }
