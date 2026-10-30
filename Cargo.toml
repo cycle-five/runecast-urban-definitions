@@ -1,0 +1,20 @@
+[package]
+name = "urban-definitions-wire"
+version = "0.1.0"
+edition = "2021"
+description = "Wire types and ticket signing for the RuneCast urban-definitions service"
+repository = "https://github.com/cycle-five/runecast-urban-definitions"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# The lib stays at the repo root so the backend can depend on it by git rev;
+# the service binary is a sibling workspace member.
+[workspace]
+members = ["service"]
+resolver = "2"
