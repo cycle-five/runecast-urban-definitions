@@ -56,3 +56,22 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+
+  docker-build:
+    name: Docker build (validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Validate the service image builds (no push). image.yml only runs on
+      # master/tags, so this is the pre-merge gate on the workspace-aware Dockerfile.
+      - name: Build service image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: service/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

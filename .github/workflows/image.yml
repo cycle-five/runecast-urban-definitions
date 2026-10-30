@@ -1,13 +1,67 @@
 name: Publish Service Image
 
-# Placeholder so `gh workflow run image.yml --ref <branch>` can dispatch the
-# branch's real workflow (GitHub requires a workflow to exist on the default
-# branch before it can be dispatched). PR #1 replaces this file.
+# Build and publish the urban-definitions-service OCI image to GHCR.
+#
+# Triggers:
+#   - push to master  → :sha-<sha>, :latest
+#   - push of v* tag  → :sha-<sha>, :vX.Y.Z
+#
+# The workspace docker-compose pulls `ghcr.io/cycle-five/runecast-urban-definitions:latest`.
+# The build context is the repo ROOT (the service depends on the lib at the
+# workspace root via `path = ".."`); the Dockerfile lives at service/Dockerfile.
+
 on:
   workflow_dispatch:
+  push:
+    branches: [master]
+    tags: ['v*']
+    # Docs-only changes don't alter the image — skip the build. Release tags
+    # always carry a Cargo.toml version-bump commit (a non-.md change), so this
+    # filter never skips a tagged release build.
+    paths-ignore: ['**.md', 'LICENSE-*', '.gitignore']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: cycle-five/runecast-urban-definitions
 
 jobs:
-  placeholder:
+  build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
-      - run: echo "Placeholder; dispatch with --ref feature/initial."
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: service/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: ${{ github.ref == 'refs/heads/master' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
