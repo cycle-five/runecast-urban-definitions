@@ -15,9 +15,11 @@ use crate::index::{IndexBuilder, MAX_LINE_BYTES};
 use crate::known::KnownFile;
 use crate::store::Definitions;
 
-pub const CHUNK_SIZE: u64 = 8_388_608;
+pub use crate::known::PRODUCTION_CHUNK_SIZE as CHUNK_SIZE;
 pub const MAX_UPLOADS: usize = 4;
 pub const IDLE_SECS: i64 = 600;
+/// No upload outlives this, whatever its activity.
+pub const MAX_UPLOAD_SECS: i64 = 7200;
 const MAX_NONCE_CHARS: usize = 64;
 
 pub trait Clock: Send + Sync {
@@ -50,6 +52,9 @@ pub enum ChunkStep {
 struct Upload {
     size: u64,
     expected: [u8; 32],
+    chunk_size: u64,
+    chunks: Arc<[[u8; 32]]>,
+    started_at: i64,
     received: u64,
     /// Length of the last accepted chunk, to recognise a re-send.
     last_len: u64,
@@ -166,6 +171,9 @@ impl Uploads {
                 state: Arc::new(Mutex::new(Upload {
                     size: req.size,
                     expected: known.sha256,
+                    chunk_size: known.chunk_size,
+                    chunks: known.chunks.clone(),
+                    started_at: now,
                     received: 0,
                     last_len: 0,
                     last_active: now,
@@ -177,7 +185,7 @@ impl Uploads {
         );
         Ok(StartedUpload {
             upload_id,
-            chunk_size: CHUNK_SIZE,
+            chunk_size: known.chunk_size,
             mode,
         })
     }
@@ -221,7 +229,7 @@ impl Uploads {
         bytes: &[u8],
     ) -> Result<ChunkStep, ErrorCode> {
         let len = bytes.len() as u64;
-        if len > CHUNK_SIZE {
+        if len > up.chunk_size {
             return Err(ErrorCode::ChunkTooLarge);
         }
         let progress = |up: &Upload| {
@@ -240,6 +248,18 @@ impl Uploads {
         }
         if up.received + len > up.size {
             return Err(ErrorCode::ChunkTooLarge);
+        }
+
+        // Nothing unverified is parsed or counted: the chunk must be exactly
+        // the expected length and match the compiled-in hash for its slot.
+        let expected_len = up.chunk_size.min(up.size - up.received);
+        let slot = (up.received / up.chunk_size) as usize;
+        if len != expected_len {
+            return Err(ErrorCode::WrongFile);
+        }
+        match up.chunks.get(slot) {
+            Some(want) if <[u8; 32]>::from(Sha256::digest(bytes)) == *want => {}
+            _ => return Err(ErrorCode::WrongFile),
         }
 
         up.hasher.update(bytes);
@@ -281,6 +301,26 @@ impl Uploads {
         })
     }
 
+    /// A cheap look before a chunk body is read: the upload exists and the
+    /// offset is the expected one or a re-send of the last chunk. Never waits
+    /// for a chunk that is being parsed (that case passes; the chunk step
+    /// itself decides).
+    pub fn precheck(&self, upload_id: &str, offset: u64) -> Result<(), ErrorCode> {
+        let (_, state) = self.state_of(upload_id)?;
+        let verdict = match state.try_lock() {
+            Ok(up) => {
+                let resend = up.last_len > 0 && offset + up.last_len == up.received;
+                if offset == up.received || resend {
+                    Ok(())
+                } else {
+                    Err(ErrorCode::WrongOffset)
+                }
+            }
+            Err(_) => Ok(()),
+        };
+        verdict
+    }
+
     /// True when this call removed a live upload.
     pub fn cancel(&self, upload_id: &str) -> bool {
         self.lock().remove(upload_id)
@@ -291,9 +331,9 @@ impl Uploads {
         self.lock().uploads.get(upload_id).map(|e| e.user_id)
     }
 
-    /// Drops idle uploads (freeing the load slot) and nonces whose tickets
-    /// have expired anyway. Called by the server every 30 s. Returns how many
-    /// idle uploads it dropped.
+    /// Drops idle uploads and uploads older than `MAX_UPLOAD_SECS` (freeing the
+    /// load slot), and nonces whose tickets have expired anyway. Called by the
+    /// server every 30 s. Returns how many uploads it dropped.
     pub fn sweep(&self) -> usize {
         let now = self.clock.now_unix();
         let mut inner = self.lock();
@@ -301,7 +341,7 @@ impl Uploads {
             .uploads
             .iter()
             .filter(|(_, e)| match e.state.try_lock() {
-                Ok(up) => now - up.last_active > IDLE_SECS,
+                Ok(up) => now - up.last_active > IDLE_SECS || now - up.started_at > MAX_UPLOAD_SECS,
                 // Busy hashing a chunk right now: not idle.
                 Err(TryLockError::WouldBlock) => false,
                 Err(TryLockError::Poisoned(_)) => true,
@@ -376,27 +416,39 @@ mod tests {
         clock: Arc<FakeClock>,
     }
 
-    fn known_for(bytes: &[u8]) -> KnownFile {
+    /// Chunk size the default rig uses for the fixture.
+    const TEST_CHUNK: usize = 10;
+
+    fn known_for(bytes: &[u8], chunk_size: usize) -> KnownFile {
         KnownFile {
             size: bytes.len() as u64,
             sha256: Sha256::digest(bytes).into(),
+            chunk_size: chunk_size as u64,
+            chunks: bytes
+                .chunks(chunk_size)
+                .map(|c| <[u8; 32]>::from(Sha256::digest(c)))
+                .collect(),
         }
     }
 
+    /// The whole of `bytes` is one chunk.
     fn rig_for(bytes: &[u8]) -> Rig {
+        rig_cs(bytes, bytes.len())
+    }
+
+    fn rig_cs(bytes: &[u8], chunk_size: usize) -> Rig {
+        rig_known(known_for(bytes, chunk_size))
+    }
+
+    fn rig_known(known: KnownFile) -> Rig {
         let store = Arc::new(Definitions::new());
         let clock = Arc::new(FakeClock(AtomicI64::new(1_000)));
-        let up = Uploads::new(
-            vec![known_for(bytes)],
-            KEY.to_vec(),
-            store.clone(),
-            clock.clone(),
-        );
+        let up = Uploads::new(vec![known], KEY.to_vec(), store.clone(), clock.clone());
         Rig { up, store, clock }
     }
 
     fn rig() -> Rig {
-        rig_for(FIXTURE)
+        rig_cs(FIXTURE, TEST_CHUNK)
     }
 
     fn ticket_for(user_id: i64, nonce: &str, expires_at: i64) -> String {
@@ -415,6 +467,14 @@ mod tests {
             ticket: ticket_for(user, nonce, 1_000 + 1800),
             size: FIXTURE.len() as u64,
         })
+    }
+
+    fn start_as_size(r: &Rig, user: i64, nonce: &str, size: usize) -> StartedUpload {
+        r.up.start(StartUpload {
+            ticket: ticket_for(user, nonce, 1_000 + 1800),
+            size: size as u64,
+        })
+        .unwrap()
     }
 
     /// Send `bytes` in `step`-sized chunks; returns the last step.
@@ -476,8 +536,8 @@ mod tests {
         let r = rig();
         let s = start_as(&r, 7, "a").unwrap();
         assert_eq!(s.mode, UploadMode::Load);
-        assert_eq!(s.chunk_size, CHUNK_SIZE);
-        let step = send_all(&r, &s.upload_id, FIXTURE, 7).unwrap();
+        assert_eq!(s.chunk_size, TEST_CHUNK as u64);
+        let step = send_all(&r, &s.upload_id, FIXTURE, TEST_CHUNK).unwrap();
         assert_eq!(
             step,
             ChunkStep::Matched {
@@ -497,7 +557,7 @@ mod tests {
     #[test]
     fn whole_file_in_one_chunk_and_odd_sizes_agree() {
         for step in [1usize, 3, 100, FIXTURE.len()] {
-            let r = rig();
+            let r = rig_cs(FIXTURE, step);
             let s = start_as(&r, 7, "a").unwrap();
             send_all(&r, &s.upload_id, FIXTURE, step).unwrap();
             let idx = r.store.get().unwrap();
@@ -519,7 +579,7 @@ mod tests {
         while bytes.last() == Some(&b'\n') {
             bytes.pop();
         }
-        let r = rig_for(&bytes);
+        let r = rig_cs(&bytes, 5);
         let s =
             r.up.start(StartUpload {
                 ticket: ticket_for(1, "a", 2_800),
@@ -551,7 +611,7 @@ mod tests {
         let bytes = text.into_bytes();
         assert!(!bytes.is_ascii());
         for step in [1usize, 2, 3, 5] {
-            let r = rig_for(&bytes);
+            let r = rig_cs(&bytes, step);
             let s =
                 r.up.start(StartUpload {
                     ticket: ticket_for(1, "a", 2_800),
@@ -570,12 +630,12 @@ mod tests {
     fn second_upload_only_proves() {
         let r = rig();
         let a = start_as(&r, 1, "a").unwrap();
-        send_all(&r, &a.upload_id, FIXTURE, 4096).unwrap();
+        send_all(&r, &a.upload_id, FIXTURE, TEST_CHUNK).unwrap();
         let first = r.store.get().unwrap();
 
         let b = start_as(&r, 2, "b").unwrap();
         assert_eq!(b.mode, UploadMode::Prove);
-        let step = send_all(&r, &b.upload_id, FIXTURE, 4096).unwrap();
+        let step = send_all(&r, &b.upload_id, FIXTURE, TEST_CHUNK).unwrap();
         assert_eq!(
             step,
             ChunkStep::Matched {
@@ -665,7 +725,7 @@ mod tests {
 
     #[test]
     fn resent_last_chunk_is_idempotent() {
-        let r = rig();
+        let r = rig_cs(FIXTURE, 50);
         let s = start_as(&r, 1, "a").unwrap();
         let step = 50usize;
         let mut offset = 0;
@@ -707,9 +767,22 @@ mod tests {
     }
 
     #[test]
+    fn precheck_accepts_next_offset_and_last_resend_only() {
+        let r = rig();
+        let s = start_as(&r, 1, "a").unwrap();
+        assert_eq!(r.up.precheck("nope", 0), Err(ErrorCode::NotFound));
+        assert_eq!(r.up.precheck(&s.upload_id, 0), Ok(()));
+        assert_eq!(r.up.precheck(&s.upload_id, 10), Err(ErrorCode::WrongOffset));
+        r.up.chunk(&s.upload_id, 0, &FIXTURE[..10]).unwrap();
+        assert_eq!(r.up.precheck(&s.upload_id, 10), Ok(()));
+        assert_eq!(r.up.precheck(&s.upload_id, 0), Ok(()), "re-send");
+        assert_eq!(r.up.precheck(&s.upload_id, 5), Err(ErrorCode::WrongOffset));
+    }
+
+    #[test]
     fn oversize_chunk_is_refused() {
         let big = vec![b'a'; CHUNK_SIZE as usize + 1];
-        let r = rig_for(&big);
+        let r = rig_cs(&big, CHUNK_SIZE as usize);
         let s =
             r.up.start(StartUpload {
                 ticket: ticket_for(1, "a", 2_800),
@@ -740,7 +813,7 @@ mod tests {
         let mut bad = FIXTURE.to_vec();
         let at = bad.iter().position(|&c| c == b'J').unwrap();
         bad[at] = b'K'; // still valid JSON, different hash
-        let err = send_all(&r, &s.upload_id, &bad, 64).unwrap_err();
+        let err = send_all(&r, &s.upload_id, &bad, TEST_CHUNK).unwrap_err();
         assert_eq!(err, ErrorCode::WrongFile);
         assert!(r.store.get().is_none());
         assert_eq!(
@@ -771,7 +844,7 @@ mod tests {
     #[test]
     fn endless_line_aborts_as_wrong_file() {
         let bytes = vec![b'a'; MAX_LINE_BYTES + 10];
-        let r = rig_for(&bytes);
+        let r = rig_cs(&bytes, 100_000);
         let s =
             r.up.start(StartUpload {
                 ticket: ticket_for(1, "a", 2_800),
@@ -782,6 +855,115 @@ mod tests {
             send_all(&r, &s.upload_id, &bytes, 100_000).unwrap_err(),
             ErrorCode::WrongFile
         );
+    }
+
+    #[test]
+    fn whole_file_hash_still_gates_publishing() {
+        // Honest chunk table, wrong whole-file hash: nothing is published.
+        let mut known = known_for(FIXTURE, TEST_CHUNK);
+        known.sha256 = [0u8; 32];
+        let r = rig_known(known);
+        let s = start_as(&r, 1, "a").unwrap();
+        assert_eq!(
+            send_all(&r, &s.upload_id, FIXTURE, TEST_CHUNK).unwrap_err(),
+            ErrorCode::WrongFile
+        );
+        assert!(r.store.get().is_none());
+    }
+
+    #[test]
+    fn a_crafted_valid_chunk_is_refused_at_that_chunk() {
+        let crafted = b"{\"word\":\"EVIL\",\"definition\":\"x\"}\n".to_vec();
+        let r = rig_cs(FIXTURE, crafted.len());
+        let s = start_as(&r, 1, "a").unwrap();
+        // Valid JSON, right length, wrong hash: refused before any parsing.
+        assert_eq!(
+            r.up.chunk(&s.upload_id, 0, &crafted).unwrap_err(),
+            ErrorCode::WrongFile
+        );
+        assert_eq!(
+            r.up.progress(&s.upload_id).unwrap_err(),
+            ErrorCode::NotFound
+        );
+        assert!(r.store.get().is_none());
+        assert_eq!(start_as(&r, 2, "b").unwrap().mode, UploadMode::Load);
+    }
+
+    #[test]
+    fn an_empty_chunk_is_refused() {
+        let r = rig();
+        let s = start_as(&r, 1, "a").unwrap();
+        assert_eq!(
+            r.up.chunk(&s.upload_id, 0, &[]).unwrap_err(),
+            ErrorCode::WrongFile
+        );
+        assert_eq!(
+            r.up.progress(&s.upload_id).unwrap_err(),
+            ErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn a_wrong_length_non_final_chunk_is_refused() {
+        let r = rig();
+        let s = start_as(&r, 1, "a").unwrap();
+        assert_eq!(
+            r.up.chunk(&s.upload_id, 0, &FIXTURE[..TEST_CHUNK - 1])
+                .unwrap_err(),
+            ErrorCode::WrongFile
+        );
+        assert_eq!(
+            r.up.progress(&s.upload_id).unwrap_err(),
+            ErrorCode::NotFound
+        );
+    }
+
+    #[test]
+    fn a_short_final_chunk_is_accepted_but_a_wrong_length_one_is_not() {
+        let bytes = vec![b'\n'; 27];
+        let r = rig_cs(&bytes, 10);
+        let s = start_as_size(&r, 1, "a", bytes.len());
+        r.up.chunk(&s.upload_id, 0, &bytes[..10]).unwrap();
+        r.up.chunk(&s.upload_id, 10, &bytes[10..20]).unwrap();
+        // The last piece is 7 bytes, not 6.
+        assert_eq!(
+            r.up.chunk(&s.upload_id, 20, &bytes[20..26]).unwrap_err(),
+            ErrorCode::WrongFile
+        );
+        let r = rig_cs(&bytes, 10);
+        let s = start_as_size(&r, 1, "a", bytes.len());
+        send_all(&r, &s.upload_id, &bytes, 10).unwrap();
+        assert!(r.store.get().is_some());
+    }
+
+    #[test]
+    fn an_upload_expires_at_the_absolute_deadline_whatever_its_activity() {
+        let r = rig();
+        let s = start_as(&r, 1, "a").unwrap();
+        let mut offset = 0usize;
+        // A chunk every 5 minutes keeps it idle-fresh the whole time.
+        while r.clock.0.load(Ordering::SeqCst) - 1_000 <= MAX_UPLOAD_SECS {
+            r.clock.0.fetch_add(300, Ordering::SeqCst);
+            if r.clock.0.load(Ordering::SeqCst) - 1_000 <= MAX_UPLOAD_SECS {
+                r.up.chunk(&s.upload_id, offset as u64, &FIXTURE[offset..offset + 10])
+                    .unwrap();
+                offset += 10;
+                assert_eq!(r.up.sweep(), 0, "still inside the deadline");
+            }
+        }
+        assert_eq!(r.up.sweep(), 1);
+        assert_eq!(
+            r.up.progress(&s.upload_id).unwrap_err(),
+            ErrorCode::NotFound
+        );
+        // The load slot is free again.
+        let b =
+            r.up.start(StartUpload {
+                ticket: ticket_for(2, "b", r.clock.0.load(Ordering::SeqCst) + 1800),
+                size: FIXTURE.len() as u64,
+            })
+            .unwrap();
+        assert_eq!(b.mode, UploadMode::Load);
     }
 
     #[test]

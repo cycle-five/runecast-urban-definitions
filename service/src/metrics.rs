@@ -25,6 +25,28 @@ pub fn init() {
     }
     metrics::gauge!("urban_definitions_loaded").set(0.0);
     metrics::gauge!("urban_definitions_entries").set(0.0);
+    metrics::gauge!("urban_definitions_resident_bytes").set(0.0);
+}
+
+/// Linux page size; `/proc/self/statm` counts pages.
+const PAGE_BYTES: u64 = 4096;
+
+/// Resident bytes from the text of `/proc/self/statm` (second field, in
+/// pages); 0 when it cannot be parsed.
+pub fn parse_statm(statm: &str) -> u64 {
+    statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|p| p.parse::<u64>().ok())
+        .map_or(0, |pages| pages * PAGE_BYTES)
+}
+
+/// Publishes the process's resident memory (0 if unreadable).
+pub fn record_resident() {
+    let bytes = std::fs::read_to_string("/proc/self/statm")
+        .map(|t| parse_statm(&t))
+        .unwrap_or(0);
+    metrics::gauge!("urban_definitions_resident_bytes").set(bytes as f64);
 }
 
 pub fn upload(outcome: &'static str) {
@@ -52,5 +74,22 @@ pub fn refusal_label(code: ErrorCode) -> Option<&'static str> {
         ErrorCode::TooManyUploads => Some("too_many"),
         ErrorCode::WrongFile => Some("wrong_file"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_statm;
+
+    #[test]
+    fn statm_resident_is_the_second_field_in_pages() {
+        assert_eq!(parse_statm("5000 250 100 10 0 400 0\n"), 250 * 4096);
+    }
+
+    #[test]
+    fn unreadable_statm_is_zero() {
+        assert_eq!(parse_statm(""), 0);
+        assert_eq!(parse_statm("5000"), 0);
+        assert_eq!(parse_statm("5000 abc"), 0);
     }
 }

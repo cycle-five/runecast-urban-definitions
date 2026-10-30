@@ -6,7 +6,8 @@ name: Publish Service Image
 #   - push to master  → :sha-<sha>, :latest
 #   - push of v* tag  → :sha-<sha>, :vX.Y.Z
 #
-# The workspace docker-compose pulls `ghcr.io/cycle-five/runecast-urban-definitions:latest`.
+# The workspace docker-compose pulls a pinned version,
+# `ghcr.io/cycle-five/runecast-urban-definitions:${URBAN_DEFINITIONS_TAG:-v0.1.0}`.
 # The build context is the repo ROOT (the service depends on the lib at the
 # workspace root via `path = ".."`); the Dockerfile lives at service/Dockerfile.
 

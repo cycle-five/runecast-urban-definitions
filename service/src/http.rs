@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
+    body::Body,
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -15,6 +16,7 @@ use axum::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use urban_definitions_wire::{
     ApiError, ChunkResponse, ErrorCode, LookupResponse, StartUpload, UploadOutcome,
 };
@@ -30,6 +32,9 @@ pub const FINISHED_KEEP_SECS: i64 = 600;
 /// nginx `client_max_body_size 9m`: a chunk plus 1 MiB of slack, so a body one
 /// byte over `CHUNK_SIZE` reaches the handler and gets `chunk_too_large`.
 const CHUNK_BODY_LIMIT: usize = CHUNK_SIZE as usize + (1 << 20);
+/// At most this many chunk requests are in flight at once (each can hold up
+/// to a 9 MiB body).
+pub const CHUNK_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Finished {
@@ -86,6 +91,7 @@ impl AppState {
         for _ in 0..self.uploads.sweep() {
             m::upload("abandoned");
         }
+        m::record_resident();
         let cutoff = self.clock.now_unix() - FINISHED_KEEP_SECS;
         self.finished
             .lock()
@@ -134,7 +140,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/urban-definitions/uploads/{id}/chunks/{offset}",
-            put(chunk).layer(DefaultBodyLimit::max(CHUNK_BODY_LIMIT)),
+            put(chunk).layer(GlobalConcurrencyLimitLayer::new(CHUNK_CONCURRENCY)),
         )
         .route("/urban-definitions/metrics", get(metrics_page))
         .route("/internal/definitions/{word}", get(lookup))
@@ -194,9 +200,17 @@ async fn progress(State(s): State<AppState>, Path(id): Path<String>) -> Response
     if let Some(f) = s.settled(&id).await {
         return finished_response(f);
     }
-    match s.uploads.progress(&id) {
-        Ok(p) => Json(p).into_response(),
-        Err(code) => error(code),
+    // The per-upload lock is held while a chunk parses: wait for it on the
+    // blocking pool, not on a runtime worker.
+    let uploads = s.uploads.clone();
+    let lookup_id = id.clone();
+    match tokio::task::spawn_blocking(move || uploads.progress(&lookup_id)).await {
+        Ok(Ok(p)) => Json(p).into_response(),
+        Ok(Err(code)) => error(code),
+        Err(e) => {
+            tracing::error!(upload_id = %id, error = %e, "progress lookup panicked");
+            error(ErrorCode::Unavailable)
+        }
     }
 }
 
@@ -211,8 +225,21 @@ async fn cancel(State(s): State<AppState>, Path(id): Path<String>) -> StatusCode
 async fn chunk(
     State(s): State<AppState>,
     Path((id, offset)): Path<(String, u64)>,
-    body: axum::body::Bytes,
+    body: Body,
 ) -> Response {
+    // Cheap refusals first: an unknown upload or a wrong offset never makes
+    // the server buffer a 9 MiB body. A finished upload's re-send still gets
+    // its recorded answer.
+    if let Some(f) = s.settled(&id).await {
+        return finished_response(f);
+    }
+    if let Err(code) = s.uploads.precheck(&id, offset) {
+        return error(code);
+    }
+    let body = match axum::body::to_bytes(body, CHUNK_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
     // Run to completion even if the client disconnects: a dropped request
     // must not skip the unlock, the metrics or the final-answer record.
     match tokio::spawn(process_chunk(s, id.clone(), offset, body)).await {

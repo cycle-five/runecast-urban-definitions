@@ -12,6 +12,10 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 const KEEP: usize = 3;
 /// Cleaned text is capped at this many characters, then `…` is appended.
 const MAX_TEXT_CHARS: usize = 500;
+/// Keys outside this letter count can never be played (both dictionaries are
+/// 2..=15 letters), so the index does not store them.
+const MIN_KEY_LEN: usize = 2;
+const MAX_KEY_LEN: usize = 15;
 /// A run of this many equal letters is collapsed.
 const RUN: usize = 4;
 /// A run is capped at this many letters when collapsed.
@@ -116,7 +120,7 @@ pub fn clean_text(raw: &str) -> String {
     match joined.char_indices().nth(MAX_TEXT_CHARS) {
         Some((cut, _)) => {
             let mut out = String::with_capacity(cut + '…'.len_utf8());
-            out.push_str(&joined[..cut]);
+            out.push_str(joined[..cut].trim_end());
             out.push('…');
             out
         }
@@ -151,7 +155,8 @@ impl IndexBuilder {
             return Ok(());
         }
         let parsed: DumpLine = serde_json::from_slice(line).map_err(|_| ParseError::NotJson)?;
-        let keys = word_keys(&parsed.word);
+        let mut keys = word_keys(&parsed.word);
+        keys.retain(|(k, _)| (MIN_KEY_LEN..=MAX_KEY_LEN).contains(&k.len()));
         if keys.is_empty() {
             return Ok(());
         }
@@ -306,6 +311,42 @@ mod tests {
         assert_eq!(out.chars().count(), 501);
         assert!(out.ends_with('…'));
         assert_eq!(clean_text(&"x".repeat(500)), "x".repeat(500));
+    }
+
+    #[test]
+    fn clean_trims_whitespace_before_the_ellipsis() {
+        // The 500-character cut lands right after a space.
+        let raw = format!("{} {}", "x".repeat(499), "y".repeat(50));
+        let out = clean_text(&raw);
+        assert_eq!(out, format!("{}…", "x".repeat(499)));
+    }
+
+    fn one_line(word: &str) -> Index {
+        let mut b = IndexBuilder::new();
+        let line = format!(r#"{{"word":"{word}","definition":"d","thumbs_up":1,"thumbs_down":0}}"#);
+        b.push_line(line.as_bytes()).unwrap();
+        b.finish()
+    }
+
+    #[test]
+    fn keys_that_can_never_be_played_are_not_indexed() {
+        assert_eq!(one_line("a").entries(), 0);
+        assert_eq!(one_line("abcdefghijklmnop").entries(), 0, "16 letters");
+        assert_eq!(
+            one_line("ice cream sandwich shop").entries(),
+            0,
+            "long glued phrase"
+        );
+        assert_eq!(one_line("ab").entries(), 1);
+        assert_eq!(one_line("abcdefghijklmno").entries(), 1, "15 letters");
+    }
+
+    #[test]
+    fn a_collapsed_key_can_survive_when_the_exact_one_is_too_long() {
+        // 16 letters, collapses to 14: only the playable key is stored.
+        let idx = one_line("aaaaaaaabcdefghi");
+        assert_eq!(idx.entries(), 1);
+        assert!(!idx.lookup("AAABCDEFGHI", false).is_empty());
     }
 
     #[test]

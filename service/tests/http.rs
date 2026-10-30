@@ -7,10 +7,14 @@ use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
+use http_body::{Body as HttpBody, Frame};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sha2::{Digest, Sha256};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use tower::ServiceExt;
-use urban_definitions_service::http::{router, AppState};
+use urban_definitions_service::http::{router, AppState, CHUNK_CONCURRENCY};
 use urban_definitions_service::known::KnownFile;
 use urban_definitions_service::relay::UnlockRelay;
 use urban_definitions_service::store::Definitions;
@@ -73,6 +77,8 @@ fn rig_with(fail: bool, delay: Duration) -> Rig {
         vec![KnownFile {
             size: FIXTURE.len() as u64,
             sha256: Sha256::digest(FIXTURE).into(),
+            chunk_size: FIXTURE.len() as u64,
+            chunks: vec![<[u8; 32]>::from(Sha256::digest(FIXTURE))].into(),
         }],
         KEY.to_vec(),
         store.clone(),
@@ -394,6 +400,66 @@ async fn chunk_one_byte_over_the_limit_is_400_chunk_too_large() {
     );
 }
 
+/// A body that records whether anyone polled it.
+struct Tripwire(Arc<AtomicBool>);
+
+impl HttpBody for Tripwire {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.0.store(true, Ordering::SeqCst);
+        Poll::Ready(None)
+    }
+}
+
+fn tripwire_put(uri: &str, polled: &Arc<AtomicBool>) -> Request<Body> {
+    Request::builder()
+        .method(Method::PUT)
+        .uri(uri)
+        .body(Body::new(Tripwire(polled.clone())))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_chunk_for_an_unknown_upload_is_404_without_reading_the_body() {
+    let r = rig(false);
+    let polled = Arc::new(AtomicBool::new(false));
+    let (status, body) = send(
+        &r.app,
+        tripwire_put("/urban-definitions/uploads/nope/chunks/0", &polled),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<ApiError>(&body).unwrap().error,
+        ErrorCode::NotFound
+    );
+    assert!(!polled.load(Ordering::SeqCst), "the body must not be read");
+}
+
+#[tokio::test]
+async fn a_chunk_at_the_wrong_offset_is_refused_without_reading_the_body() {
+    let r = rig(false);
+    let up = start(&r.app, 42, "n1").await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let uri = format!("/urban-definitions/uploads/{}/chunks/77", up.upload_id);
+    let (status, body) = send(&r.app, tripwire_put(&uri, &polled)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<ApiError>(&body).unwrap().error,
+        ErrorCode::WrongOffset
+    );
+    assert!(!polled.load(Ordering::SeqCst), "the body must not be read");
+}
+
+#[test]
+fn chunk_route_is_limited_to_eight_at_once() {
+    assert_eq!(CHUNK_CONCURRENCY, 8);
+}
+
 #[tokio::test]
 async fn bodies_far_over_the_limit_get_413() {
     let r = rig(false);
@@ -436,6 +502,7 @@ async fn metrics_need_the_bearer() {
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("urban_definitions_loaded"), "{text}");
     assert!(text.contains("urban_definitions_uploads_total"), "{text}");
+    assert!(text.contains("urban_definitions_resident_bytes"), "{text}");
 }
 
 #[tokio::test]
