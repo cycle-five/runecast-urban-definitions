@@ -1,0 +1,13 @@
+name: Publish Service Image
+
+# Placeholder so `gh workflow run image.yml --ref <branch>` can dispatch the
+# branch's real workflow (GitHub requires a workflow to exist on the default
+# branch before it can be dispatched). PR #1 replaces this file.
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Placeholder; dispatch with --ref feature/initial."
