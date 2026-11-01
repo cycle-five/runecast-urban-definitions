@@ -1,50 +1,34 @@
 //! The HTTP surface, driven in-process with `tower::ServiceExt::oneshot`.
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
-use http_body::{Body as HttpBody, Frame};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sha2::{Digest, Sha256};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
 use tower::ServiceExt;
-use urban_definitions_service::http::{router, AppState, CHUNK_CONCURRENCY};
+use urban_definitions_service::clock::{Clock, SystemClock};
+use urban_definitions_service::dump;
+use urban_definitions_service::http::{router, AppState};
 use urban_definitions_service::known::KnownFile;
 use urban_definitions_service::relay::UnlockRelay;
 use urban_definitions_service::store::Definitions;
-use urban_definitions_service::uploads::{Clock, SystemClock, Uploads, CHUNK_SIZE};
-use urban_definitions_wire::{
-    sign_ticket, ApiError, ChunkResponse, ErrorCode, LookupResponse, StartUpload, StartedUpload,
-    Ticket, UploadOutcome,
-};
+use urban_definitions_wire::LookupResponse;
 
-const KEY: &[u8] = b"test-key";
 const INTERNAL: &str = "internal-token";
 const METRICS: &str = "metrics-token";
 const FIXTURE: &[u8] = include_bytes!("fixtures/mini.ndjson");
 
-#[derive(Default)]
-struct FakeRelay {
-    calls: Mutex<Vec<i64>>,
-    fail: bool,
-    delay: Duration,
-}
+/// Nothing in this file asks for an unlock.
+struct NoRelay;
 
 #[async_trait]
-impl UnlockRelay for FakeRelay {
-    async fn unlock(&self, user_id: i64) -> anyhow::Result<()> {
-        self.calls.lock().unwrap().push(user_id);
-        tokio::time::sleep(self.delay).await;
-        if self.fail {
-            anyhow::bail!("backend unreachable");
-        }
-        Ok(())
+impl UnlockRelay for NoRelay {
+    async fn unlock(&self, _user_id: i64) -> anyhow::Result<()> {
+        anyhow::bail!("no unlock expected")
     }
 }
 
@@ -63,57 +47,39 @@ fn prometheus() -> PrometheusHandle {
 
 struct Rig {
     app: Router,
-    relay: Arc<FakeRelay>,
+    store: Arc<Definitions>,
 }
 
-fn rig(fail: bool) -> Rig {
-    rig_with(fail, Duration::ZERO)
-}
-
-fn rig_with(fail: bool, delay: Duration) -> Rig {
+fn rig() -> Rig {
     let store = Arc::new(Definitions::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let uploads = Arc::new(Uploads::new(
-        vec![KnownFile {
-            size: FIXTURE.len() as u64,
-            sha256: Sha256::digest(FIXTURE).into(),
-            chunk_size: FIXTURE.len() as u64,
-            chunks: vec![<[u8; 32]>::from(Sha256::digest(FIXTURE))].into(),
-        }],
-        KEY.to_vec(),
+    let state = AppState::new(
         store.clone(),
-        clock.clone(),
-    ));
-    let relay = Arc::new(FakeRelay {
-        fail,
-        delay,
-        ..Default::default()
-    });
-    let mut state = AppState::new(
-        uploads,
-        store,
-        relay.clone(),
+        Arc::new(NoRelay),
         INTERNAL.into(),
         METRICS.into(),
         prometheus(),
         clock,
     );
-    state.retry_delay = Duration::from_millis(1);
     Rig {
         app: router(state),
-        relay,
+        store,
     }
 }
 
-fn ticket(user_id: i64, nonce: &str) -> String {
-    sign_ticket(
-        KEY,
-        &Ticket {
-            user_id,
-            nonce: nonce.into(),
-            expires_at: SystemClock.now_unix() + 1800,
-        },
-    )
+/// Loads the fixture the way production loads muninn's file: zstd in,
+/// verified, index and proof table out.
+fn publish_fixture(store: &Definitions) {
+    let known = KnownFile {
+        size: FIXTURE.len() as u64,
+        sha256: Sha256::digest(FIXTURE).into(),
+        chunk_size: FIXTURE.len() as u64,
+        chunks: vec![<[u8; 32]>::from(Sha256::digest(FIXTURE))].into(),
+    };
+    let compressed = zstd::encode_all(FIXTURE, 3).unwrap();
+    let far_future = Instant::now() + Duration::from_secs(3600);
+    let dump = dump::load(&compressed[..], &known, 64, far_future).expect("fixture loads");
+    store.publish(dump);
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
@@ -123,50 +89,12 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body.to_vec())
 }
 
-fn json_post(uri: &str, body: &impl serde::Serialize) -> Request<Body> {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(body).unwrap()))
-        .unwrap()
-}
-
-fn put_chunk(id: &str, offset: u64, bytes: Vec<u8>) -> Request<Body> {
-    Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/urban-definitions/uploads/{id}/chunks/{offset}"))
-        .body(Body::from(bytes))
-        .unwrap()
-}
-
 fn get(uri: &str, header: Option<(&str, &str)>) -> Request<Body> {
     let mut b = Request::builder().method(Method::GET).uri(uri);
     if let Some((k, v)) = header {
         b = b.header(k, v);
     }
     b.body(Body::empty()).unwrap()
-}
-
-async fn start(app: &Router, user: i64, nonce: &str) -> StartedUpload {
-    let (status, body) = send(
-        app,
-        json_post(
-            "/urban-definitions/uploads",
-            &StartUpload {
-                ticket: ticket(user, nonce),
-                size: FIXTURE.len() as u64,
-            },
-        ),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    serde_json::from_slice(&body).unwrap()
 }
 
 async fn lookup(app: &Router, word: &str) -> LookupResponse {
@@ -182,39 +110,27 @@ async fn lookup(app: &Router, word: &str) -> LookupResponse {
     serde_json::from_slice(&body).unwrap()
 }
 
-fn finished(outcome: UploadOutcome) -> String {
-    serde_json::to_string(&ChunkResponse::Finished { outcome }).unwrap()
+#[tokio::test]
+async fn upload_routes_are_gone() {
+    let r = rig();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/urban-definitions/uploads")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"ticket":"t","size":5}"#))
+        .unwrap();
+    let (s, _) = send(&r.app, req).await;
+    assert!(
+        s == StatusCode::NOT_FOUND || s == StatusCode::METHOD_NOT_ALLOWED,
+        "{s}"
+    );
 }
 
 #[tokio::test]
-async fn full_upload_loads_and_unlocks() {
-    let r = rig(false);
+async fn a_published_dump_serves_a_hit() {
+    let r = rig();
     assert_eq!(lookup(&r.app, "JANKY").await, LookupResponse::Empty);
-    let up = start(&r.app, 42, "n1").await;
-    let (status, body) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        String::from_utf8(body).unwrap(),
-        r#"{"status":"finished","outcome":"loaded"}"#
-    );
-    assert_eq!(*r.relay.calls.lock().unwrap(), vec![42]);
-    match lookup(&r.app, "JANKY").await {
-        LookupResponse::Loaded { definitions } => assert!(!definitions.is_empty()),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn relay_failure_still_publishes_and_reports_unlock_failed() {
-    let r = rig(true);
-    let up = start(&r.app, 42, "n1").await;
-    let (status, body) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        String::from_utf8(body).unwrap(),
-        finished(UploadOutcome::UnlockFailed)
-    );
-    assert_eq!(r.relay.calls.lock().unwrap().len(), 3);
+    publish_fixture(&r.store);
     assert!(matches!(
         lookup(&r.app, "JANKY").await,
         LookupResponse::Loaded { definitions } if !definitions.is_empty()
@@ -222,110 +138,8 @@ async fn relay_failure_still_publishes_and_reports_unlock_failed() {
 }
 
 #[tokio::test]
-async fn resent_final_chunk_gets_the_same_answer_without_a_second_unlock() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let uri = format!("/urban-definitions/uploads/{}", up.upload_id);
-    let (_, first) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    let (status, again) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(again, first);
-    assert_eq!(
-        String::from_utf8(again).unwrap(),
-        r#"{"status":"finished","outcome":"loaded"}"#
-    );
-    let (status, polled) = send(&r.app, get(&uri, None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(polled, first);
-    assert_eq!(r.relay.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn wrong_file_is_400_and_stays_400_on_a_resend() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let mut bad = FIXTURE.to_vec();
-    bad[0] = b' ';
-    for _ in 0..2 {
-        let (status, body) = send(&r.app, put_chunk(&up.upload_id, 0, bad.clone())).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            serde_json::from_slice::<ApiError>(&body).unwrap().error,
-            ErrorCode::WrongFile
-        );
-    }
-    assert!(r.relay.calls.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn progress_and_cancel() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let uri = format!("/urban-definitions/uploads/{}", up.upload_id);
-    let (status, body) = send(&r.app, get(&uri, None)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        String::from_utf8(body).unwrap(),
-        format!(r#"{{"received":0,"size":{}}}"#, FIXTURE.len())
-    );
-    let del = Request::builder()
-        .method(Method::DELETE)
-        .uri(&uri)
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(send(&r.app, del).await.0, StatusCode::NO_CONTENT);
-    assert_eq!(send(&r.app, get(&uri, None)).await.0, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn start_errors_map_to_statuses() {
-    let r = rig(false);
-    let bad_size = StartUpload {
-        ticket: ticket(1, "a"),
-        size: 7,
-    };
-    let (s, _) = send(&r.app, json_post("/urban-definitions/uploads", &bad_size)).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    let bad_ticket = StartUpload {
-        ticket: "nope".into(),
-        size: FIXTURE.len() as u64,
-    };
-    let (s, body) = send(&r.app, json_post("/urban-definitions/uploads", &bad_ticket)).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::BadTicket
-    );
-    start(&r.app, 5, "same-user").await;
-    let again = StartUpload {
-        ticket: ticket(5, "other"),
-        size: FIXTURE.len() as u64,
-    };
-    let (s, body) = send(&r.app, json_post("/urban-definitions/uploads", &again)).await;
-    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::TooManyUploads
-    );
-    let second_loader = StartUpload {
-        ticket: ticket(6, "n6"),
-        size: FIXTURE.len() as u64,
-    };
-    let (s, body) = send(
-        &r.app,
-        json_post("/urban-definitions/uploads", &second_loader),
-    )
-    .await;
-    assert_eq!(s, StatusCode::CONFLICT);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::Busy
-    );
-}
-
-#[tokio::test]
 async fn internal_routes_need_the_token() {
-    let r = rig(false);
+    let r = rig();
     let (s, _) = send(&r.app, get("/internal/definitions/JANKY", None)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = send(
@@ -345,9 +159,8 @@ async fn internal_routes_need_the_token() {
 
 #[tokio::test]
 async fn unknown_word_is_an_empty_list_and_lookup_uppercases() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
+    let r = rig();
+    publish_fixture(&r.store);
     assert_eq!(
         lookup(&r.app, "zzzzqq").await,
         LookupResponse::Loaded {
@@ -362,9 +175,8 @@ async fn unknown_word_is_an_empty_list_and_lookup_uppercases() {
 
 #[tokio::test]
 async fn glued_flag_reaches_the_index() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
+    let r = rig();
+    publish_fixture(&r.store);
     let ask = |glued: &str| {
         get(
             &format!("/internal/definitions/ICECREAM?glued={glued}"),
@@ -385,100 +197,8 @@ async fn glued_flag_reaches_the_index() {
 }
 
 #[tokio::test]
-async fn chunk_one_byte_over_the_limit_is_400_chunk_too_large() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let (status, body) = send(
-        &r.app,
-        put_chunk(&up.upload_id, 0, vec![b'x'; CHUNK_SIZE as usize + 1]),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::ChunkTooLarge
-    );
-}
-
-/// A body that records whether anyone polled it.
-struct Tripwire(Arc<AtomicBool>);
-
-impl HttpBody for Tripwire {
-    type Data = axum::body::Bytes;
-    type Error = std::convert::Infallible;
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.0.store(true, Ordering::SeqCst);
-        Poll::Ready(None)
-    }
-}
-
-fn tripwire_put(uri: &str, polled: &Arc<AtomicBool>) -> Request<Body> {
-    Request::builder()
-        .method(Method::PUT)
-        .uri(uri)
-        .body(Body::new(Tripwire(polled.clone())))
-        .unwrap()
-}
-
-#[tokio::test]
-async fn a_chunk_for_an_unknown_upload_is_404_without_reading_the_body() {
-    let r = rig(false);
-    let polled = Arc::new(AtomicBool::new(false));
-    let (status, body) = send(
-        &r.app,
-        tripwire_put("/urban-definitions/uploads/nope/chunks/0", &polled),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::NotFound
-    );
-    assert!(!polled.load(Ordering::SeqCst), "the body must not be read");
-}
-
-#[tokio::test]
-async fn a_chunk_at_the_wrong_offset_is_refused_without_reading_the_body() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let polled = Arc::new(AtomicBool::new(false));
-    let uri = format!("/urban-definitions/uploads/{}/chunks/77", up.upload_id);
-    let (status, body) = send(&r.app, tripwire_put(&uri, &polled)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        serde_json::from_slice::<ApiError>(&body).unwrap().error,
-        ErrorCode::WrongOffset
-    );
-    assert!(!polled.load(Ordering::SeqCst), "the body must not be read");
-}
-
-#[test]
-fn chunk_route_is_limited_to_eight_at_once() {
-    assert_eq!(CHUNK_CONCURRENCY, 8);
-}
-
-#[tokio::test]
-async fn bodies_far_over_the_limit_get_413() {
-    let r = rig(false);
-    let up = start(&r.app, 42, "n1").await;
-    let (status, _) = send(
-        &r.app,
-        put_chunk(
-            &up.upload_id,
-            0,
-            vec![b'x'; CHUNK_SIZE as usize + (2 << 20)],
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-}
-
-#[tokio::test]
 async fn metrics_need_the_bearer() {
-    let r = rig(false);
+    let r = rig();
     let (s, _) = send(&r.app, get("/urban-definitions/metrics", None)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _) = send(
@@ -501,49 +221,5 @@ async fn metrics_need_the_bearer() {
     assert_eq!(s, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
     assert!(text.contains("urban_definitions_loaded"), "{text}");
-    assert!(text.contains("urban_definitions_uploads_total"), "{text}");
     assert!(text.contains("urban_definitions_resident_bytes"), "{text}");
-}
-
-#[tokio::test]
-async fn a_resend_during_a_slow_unlock_waits_for_the_same_answer() {
-    let r = rig_with(false, Duration::from_millis(300));
-    let up = start(&r.app, 42, "n1").await;
-    let first = tokio::spawn({
-        let app = r.app.clone();
-        let id = up.upload_id.clone();
-        async move { send(&app, put_chunk(&id, 0, FIXTURE.to_vec())).await }
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // Mid-unlock: both a re-send and a poll wait, then see the final answer.
-    let (s2, again) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    let uri = format!("/urban-definitions/uploads/{}", up.upload_id);
-    let (s3, polled) = send(&r.app, get(&uri, None)).await;
-    let (s1, original) = first.await.unwrap();
-    let expect = r#"{"status":"finished","outcome":"loaded"}"#;
-    for (status, body) in [(s1, original), (s2, again), (s3, polled)] {
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(String::from_utf8(body).unwrap(), expect);
-    }
-    assert_eq!(r.relay.calls.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn a_dropped_request_still_finishes_the_unlock_and_records_the_answer() {
-    let r = rig_with(false, Duration::from_millis(200));
-    let up = start(&r.app, 42, "n1").await;
-    // The client gives up long before the relay answers.
-    let abandoned = tokio::time::timeout(
-        Duration::from_millis(50),
-        send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())),
-    )
-    .await;
-    assert!(abandoned.is_err(), "request should have been cut short");
-    let (status, body) = send(&r.app, put_chunk(&up.upload_id, 0, FIXTURE.to_vec())).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        String::from_utf8(body).unwrap(),
-        r#"{"status":"finished","outcome":"loaded"}"#
-    );
-    assert_eq!(*r.relay.calls.lock().unwrap(), vec![42]);
 }

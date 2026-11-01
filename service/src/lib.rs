@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod config;
 pub mod dump;
 pub mod http;
@@ -6,4 +7,3 @@ pub mod known;
 pub mod metrics;
 pub mod relay;
 pub mod store;
-pub mod uploads;

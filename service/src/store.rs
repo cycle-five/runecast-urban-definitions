@@ -1,12 +1,12 @@
-//! The one published index, shared by all requests.
+//! The one published dump, shared by all requests.
 
 use std::sync::{Arc, RwLock};
 
-use crate::index::Index;
+use crate::dump::Dump;
 
 #[derive(Default)]
 pub struct Definitions {
-    index: RwLock<Option<Arc<Index>>>,
+    dump: RwLock<Option<Arc<Dump>>>,
 }
 
 impl Definitions {
@@ -14,11 +14,11 @@ impl Definitions {
         Self::default()
     }
 
-    pub fn get(&self) -> Option<Arc<Index>> {
-        self.index.read().expect("store lock poisoned").clone()
+    pub fn get(&self) -> Option<Arc<Dump>> {
+        self.dump.read().expect("store lock poisoned").clone()
     }
 
-    pub fn publish(&self, index: Index) {
-        *self.index.write().expect("store lock poisoned") = Some(Arc::new(index));
+    pub fn publish(&self, dump: Dump) {
+        *self.dump.write().expect("store lock poisoned") = Some(Arc::new(dump));
     }
 }

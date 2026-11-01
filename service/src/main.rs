@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use urban_definitions_service::clock::SystemClock;
 use urban_definitions_service::config::Config;
 use urban_definitions_service::http::{router, AppState};
-use urban_definitions_service::known::known_files;
 use urban_definitions_service::metrics;
 use urban_definitions_service::relay::HttpRelay;
 use urban_definitions_service::store::Definitions;
-use urban_definitions_service::uploads::{SystemClock, Uploads};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,18 +24,11 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(Definitions::new());
     let clock = Arc::new(SystemClock);
-    let uploads = Arc::new(Uploads::new(
-        known_files(),
-        cfg.ticket_key.clone().into_bytes(),
-        store.clone(),
-        clock.clone(),
-    ));
     let relay = Arc::new(HttpRelay::new(
         &cfg.backend_internal_url,
         cfg.internal_token.clone(),
     )?);
     let state = AppState::new(
-        uploads,
         store,
         relay,
         cfg.internal_token,
