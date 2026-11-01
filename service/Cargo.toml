@@ -10,6 +10,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 getrandom = "0.2"
 sha2 = "0.10"
+zstd = "0.13"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
 async-trait = "0.1"

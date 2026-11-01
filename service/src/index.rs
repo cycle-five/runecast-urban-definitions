@@ -236,6 +236,31 @@ impl Index {
     }
 }
 
+/// Feeds every complete line in `carry + bytes` to the builder and leaves the
+/// trailing partial line in `carry`. Splitting on the `\n` byte is safe for
+/// UTF-8: it never occurs inside a multi-byte character. `Err` covers a bad
+/// line and a carry that outgrows `MAX_LINE_BYTES`.
+#[allow(clippy::result_unit_err)] // signature fixed by the plan; the caller maps it to its own code
+pub fn feed_lines(builder: &mut IndexBuilder, carry: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ()> {
+    let mut rest = bytes;
+    while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+        let (line, tail) = (&rest[..nl], &rest[nl + 1..]);
+        if carry.is_empty() {
+            builder.push_line(line).map_err(drop)?;
+        } else {
+            carry.extend_from_slice(line);
+            builder.push_line(carry).map_err(drop)?;
+            carry.clear();
+        }
+        rest = tail;
+    }
+    carry.extend_from_slice(rest);
+    if carry.len() > MAX_LINE_BYTES {
+        return Err(());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

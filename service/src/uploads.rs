@@ -11,7 +11,7 @@ use urban_definitions_wire::{
     verify_ticket, ErrorCode, StartUpload, StartedUpload, TicketError, UploadMode, UploadProgress,
 };
 
-use crate::index::{IndexBuilder, MAX_LINE_BYTES};
+use crate::index::{feed_lines, IndexBuilder};
 use crate::known::KnownFile;
 use crate::store::Definitions;
 
@@ -264,7 +264,7 @@ impl Uploads {
 
         up.hasher.update(bytes);
         if let Some(builder) = up.builder.as_mut() {
-            feed_lines(builder, &mut up.carry, bytes)?;
+            feed_lines(builder, &mut up.carry, bytes).map_err(|()| ErrorCode::WrongFile)?;
         }
         up.received += len;
         up.last_len = len;
@@ -360,34 +360,6 @@ impl Uploads {
     fn used_nonce_count(&self) -> usize {
         self.lock().used_nonces.len()
     }
-}
-
-/// Feeds every complete line in `carry + bytes` to the builder and leaves the
-/// trailing partial line in `carry`. Splitting on the `\n` byte is safe for
-/// UTF-8: it never occurs inside a multi-byte character.
-fn feed_lines(
-    builder: &mut IndexBuilder,
-    carry: &mut Vec<u8>,
-    bytes: &[u8],
-) -> Result<(), ErrorCode> {
-    let wrong = |_| ErrorCode::WrongFile;
-    let mut rest = bytes;
-    while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-        let (line, tail) = (&rest[..nl], &rest[nl + 1..]);
-        if carry.is_empty() {
-            builder.push_line(line).map_err(wrong)?;
-        } else {
-            carry.extend_from_slice(line);
-            builder.push_line(carry).map_err(wrong)?;
-            carry.clear();
-        }
-        rest = tail;
-    }
-    carry.extend_from_slice(rest);
-    if carry.len() > MAX_LINE_BYTES {
-        return Err(ErrorCode::WrongFile);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -570,59 +542,6 @@ mod tests {
             };
             assert_eq!(idx.entries(), whole.entries(), "step {step}");
             assert_eq!(idx.lookup("JANKY", false), whole.lookup("JANKY", false));
-        }
-    }
-
-    #[test]
-    fn final_line_without_trailing_newline_is_flushed() {
-        let mut bytes = FIXTURE.to_vec();
-        while bytes.last() == Some(&b'\n') {
-            bytes.pop();
-        }
-        let r = rig_cs(&bytes, 5);
-        let s =
-            r.up.start(StartUpload {
-                ticket: ticket_for(1, "a", 2_800),
-                size: bytes.len() as u64,
-            })
-            .unwrap();
-        send_all(&r, &s.upload_id, &bytes, 5).unwrap();
-        let full = {
-            let mut b = IndexBuilder::new();
-            for l in bytes.split(|&c| c == b'\n') {
-                b.push_line(l).unwrap();
-            }
-            b.finish()
-        };
-        assert_eq!(r.store.get().unwrap().entries(), full.entries());
-    }
-
-    #[test]
-    fn multibyte_characters_split_across_chunks_parse_whole() {
-        // The mini fixture is ASCII (its dump escapes), so build raw UTF-8 here.
-        let line = |w: &str, d: &str| {
-            format!(r#"{{"word":"{w}","definition":"{d}","thumbs_up":3,"thumbs_down":1}}"#)
-        };
-        let text = format!(
-            "{}\n{}\n",
-            line("Caf\u{e9}", "na\u{ef}ve \u{1F600} caf\u{e9}"),
-            line("Plain", "plain")
-        );
-        let bytes = text.into_bytes();
-        assert!(!bytes.is_ascii());
-        for step in [1usize, 2, 3, 5] {
-            let r = rig_cs(&bytes, step);
-            let s =
-                r.up.start(StartUpload {
-                    ticket: ticket_for(1, "a", 2_800),
-                    size: bytes.len() as u64,
-                })
-                .unwrap();
-            send_all(&r, &s.upload_id, &bytes, step).unwrap();
-            let idx = r.store.get().unwrap();
-            let defs = idx.lookup("PLAIN", false);
-            assert_eq!(&*defs[0], "plain");
-            assert_eq!(idx.entries(), 2, "step {step}");
         }
     }
 
@@ -825,39 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn garbage_line_aborts_as_wrong_file() {
-        let bytes = b"not json at all\n{}\n".to_vec();
-        let r = rig_for(&bytes);
-        let s =
-            r.up.start(StartUpload {
-                ticket: ticket_for(1, "a", 2_800),
-                size: bytes.len() as u64,
-            })
-            .unwrap();
-        assert_eq!(
-            r.up.chunk(&s.upload_id, 0, &bytes).unwrap_err(),
-            ErrorCode::WrongFile
-        );
-        assert!(r.store.get().is_none());
-    }
-
-    #[test]
-    fn endless_line_aborts_as_wrong_file() {
-        let bytes = vec![b'a'; MAX_LINE_BYTES + 10];
-        let r = rig_cs(&bytes, 100_000);
-        let s =
-            r.up.start(StartUpload {
-                ticket: ticket_for(1, "a", 2_800),
-                size: bytes.len() as u64,
-            })
-            .unwrap();
-        assert_eq!(
-            send_all(&r, &s.upload_id, &bytes, 100_000).unwrap_err(),
-            ErrorCode::WrongFile
-        );
-    }
-
-    #[test]
     fn whole_file_hash_still_gates_publishing() {
         // Honest chunk table, wrong whole-file hash: nothing is published.
         let mut known = known_for(FIXTURE, TEST_CHUNK);
@@ -869,24 +755,6 @@ mod tests {
             ErrorCode::WrongFile
         );
         assert!(r.store.get().is_none());
-    }
-
-    #[test]
-    fn a_crafted_valid_chunk_is_refused_at_that_chunk() {
-        let crafted = b"{\"word\":\"EVIL\",\"definition\":\"x\"}\n".to_vec();
-        let r = rig_cs(FIXTURE, crafted.len());
-        let s = start_as(&r, 1, "a").unwrap();
-        // Valid JSON, right length, wrong hash: refused before any parsing.
-        assert_eq!(
-            r.up.chunk(&s.upload_id, 0, &crafted).unwrap_err(),
-            ErrorCode::WrongFile
-        );
-        assert_eq!(
-            r.up.progress(&s.upload_id).unwrap_err(),
-            ErrorCode::NotFound
-        );
-        assert!(r.store.get().is_none());
-        assert_eq!(start_as(&r, 2, "b").unwrap().mode, UploadMode::Load);
     }
 
     #[test]

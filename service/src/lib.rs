@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dump;
 pub mod http;
 pub mod index;
 pub mod known;
