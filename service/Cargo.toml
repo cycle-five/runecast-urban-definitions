@@ -1,15 +1,16 @@
 [package]
 name = "urban-definitions-service"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-urban-definitions-wire = { version = "0.1.0", path = ".." }
+urban-definitions-wire = { version = "0.2.0", path = ".." }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 getrandom = "0.2"
 sha2 = "0.10"
+zstd = "0.13"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
 async-trait = "0.1"
@@ -20,7 +21,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 subtle = "2"
-tower = { version = "0.5", default-features = false, features = ["limit"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

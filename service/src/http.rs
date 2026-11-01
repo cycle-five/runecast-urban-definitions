@@ -6,41 +6,36 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
-    body::Body,
-    extract::{Path, Query, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
-use tower::limit::GlobalConcurrencyLimitLayer;
 use urban_definitions_wire::{
-    ApiError, ChunkResponse, ErrorCode, LookupResponse, StartUpload, UploadOutcome,
+    ApiError, ChallengeRequest, ErrorCode, LookupResponse, ProofOutcome, ProofResponse,
 };
 
+use crate::challenges::{Challenges, CHALLENGE_PIECES};
+use crate::clock::Clock;
+use crate::dump::PROOF_PIECE_SIZE;
 use crate::metrics as m;
 use crate::relay::{unlock_with_retry, UnlockRelay};
 use crate::store::Definitions;
-use crate::uploads::{ChunkStep, Clock, Uploads, CHUNK_SIZE};
 
-/// A finished upload's final answer is kept this long, so a lost response
+/// A finished proof's final answer is kept this long, so a lost response
 /// can be re-asked.
 pub const FINISHED_KEEP_SECS: i64 = 600;
-/// nginx `client_max_body_size 9m`: a chunk plus 1 MiB of slack, so a body one
-/// byte over `CHUNK_SIZE` reaches the handler and gets `chunk_too_large`.
-const CHUNK_BODY_LIMIT: usize = CHUNK_SIZE as usize + (1 << 20);
-/// At most this many chunk requests are in flight at once (each can hold up
-/// to a 9 MiB body).
-pub const CHUNK_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Finished {
-    /// The hash matched; the unlock relay is still running.
+    /// The proof matched; the unlock relay is still running.
     Pending,
-    Done(UploadOutcome),
+    Done(ProofOutcome),
     WrongFile,
 }
 
@@ -51,7 +46,7 @@ const PENDING_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub struct AppState {
-    uploads: Arc<Uploads>,
+    challenges: Arc<Challenges>,
     store: Arc<Definitions>,
     relay: Arc<dyn UnlockRelay>,
     internal_token: Arc<str>,
@@ -59,13 +54,16 @@ pub struct AppState {
     metrics: PrometheusHandle,
     clock: Arc<dyn Clock>,
     finished: Arc<Mutex<HashMap<String, (i64, Finished)>>>,
+    /// Held across `prove` and the `Pending` record (no await inside), so a
+    /// concurrent re-send always finds a record, never a gap.
+    prove_gate: Arc<Mutex<()>>,
     /// Pause between unlock attempts.
     pub retry_delay: Duration,
 }
 
 impl AppState {
     pub fn new(
-        uploads: Arc<Uploads>,
+        challenges: Arc<Challenges>,
         store: Arc<Definitions>,
         relay: Arc<dyn UnlockRelay>,
         internal_token: String,
@@ -74,7 +72,7 @@ impl AppState {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            uploads,
+            challenges,
             store,
             relay,
             internal_token: internal_token.into(),
@@ -82,14 +80,15 @@ impl AppState {
             metrics,
             clock,
             finished: Arc::default(),
+            prove_gate: Arc::default(),
             retry_delay: Duration::from_secs(1),
         }
     }
 
-    /// Expires idle uploads and old finished records. Run every 30 s.
+    /// Expires old challenges and finished records. Run every 30 s.
     pub fn sweep(&self) {
-        for _ in 0..self.uploads.sweep() {
-            m::upload("abandoned");
+        for _ in 0..self.challenges.sweep() {
+            m::challenge("abandoned");
         }
         m::record_resident();
         let cutoff = self.clock.now_unix() - FINISHED_KEEP_SECS;
@@ -99,6 +98,7 @@ impl AppState {
             .retain(|_, (at, _)| *at > cutoff);
     }
 
+    /// Keeps the final answer for `id` for `FINISHED_KEEP_SECS`.
     fn record(&self, id: &str, what: Finished) {
         let now = self.clock.now_unix();
         self.finished
@@ -116,7 +116,7 @@ impl AppState {
     }
 
     /// The final answer for `id` if there is one; a pending match is waited
-    /// out (bounded), so the caller never sees a half-finished upload.
+    /// out (bounded), so the caller never sees a half-finished proof.
     async fn settled(&self, id: &str) -> Option<Finished> {
         let deadline = tokio::time::Instant::now() + PENDING_WAIT;
         loop {
@@ -131,16 +131,20 @@ impl AppState {
     }
 }
 
+/// A challenge request is one ticket.
+const CHALLENGE_BODY_LIMIT: usize = 4096;
+/// A proof is exactly the challenged pieces, never more.
+const PROOF_BODY_LIMIT: usize = CHALLENGE_PIECES * PROOF_PIECE_SIZE as usize;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/urban-definitions/uploads", post(start_upload))
         .route(
-            "/urban-definitions/uploads/{id}",
-            get(progress).delete(cancel),
+            "/urban-definitions/challenges",
+            post(start_challenge).layer(DefaultBodyLimit::max(CHALLENGE_BODY_LIMIT)),
         )
         .route(
-            "/urban-definitions/uploads/{id}/chunks/{offset}",
-            put(chunk).layer(GlobalConcurrencyLimitLayer::new(CHUNK_CONCURRENCY)),
+            "/urban-definitions/challenges/{id}/proof",
+            post(proof).layer(DefaultBodyLimit::max(PROOF_BODY_LIMIT)),
         )
         .route("/urban-definitions/metrics", get(metrics_page))
         .route("/internal/definitions/{word}", get(lookup))
@@ -150,17 +154,15 @@ pub fn router(state: AppState) -> Router {
 
 fn status_of(code: ErrorCode) -> StatusCode {
     match code {
-        ErrorCode::WrongSize
-        | ErrorCode::WrongOffset
-        | ErrorCode::ChunkTooLarge
-        | ErrorCode::WrongFile => StatusCode::BAD_REQUEST,
+        ErrorCode::WrongFile => StatusCode::BAD_REQUEST,
         ErrorCode::BadTicket | ErrorCode::TicketExpired | ErrorCode::TicketUsed => {
             StatusCode::UNAUTHORIZED
         }
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
-        ErrorCode::Busy => StatusCode::CONFLICT,
-        ErrorCode::TooManyUploads => StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::Busy => StatusCode::TOO_MANY_REQUESTS,
         ErrorCode::Unavailable => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Loading => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::ChallengeExpired => StatusCode::GONE,
     }
 }
 
@@ -175,14 +177,18 @@ fn token_matches(provided: Option<&str>, expected: &str) -> bool {
     }
 }
 
-async fn start_upload(State(s): State<AppState>, Json(req): Json<StartUpload>) -> Response {
-    match s.uploads.start(req) {
-        Ok(started) => (StatusCode::CREATED, Json(started)).into_response(),
+async fn start_challenge(State(s): State<AppState>, Json(req): Json<ChallengeRequest>) -> Response {
+    match s.challenges.issue(&req.ticket) {
+        Ok(challenge) => {
+            m::challenge("issued");
+            (StatusCode::CREATED, Json(challenge)).into_response()
+        }
         Err(code) => {
-            if let Some(label) = m::refusal_label(code) {
-                m::upload(label);
-            }
-            tracing::info!(?code, "upload refused");
+            m::challenge(match code {
+                ErrorCode::Loading => "loading",
+                ErrorCode::Busy => "busy",
+                _ => "bad_ticket",
+            });
             error(code)
         }
     }
@@ -191,118 +197,67 @@ async fn start_upload(State(s): State<AppState>, Json(req): Json<StartUpload>) -
 fn finished_response(f: Finished) -> Response {
     match f {
         Finished::Pending => error(ErrorCode::Unavailable),
-        Finished::Done(outcome) => Json(ChunkResponse::Finished { outcome }).into_response(),
+        Finished::Done(outcome) => Json(ProofResponse { outcome }).into_response(),
         Finished::WrongFile => error(ErrorCode::WrongFile),
     }
 }
 
-async fn progress(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+async fn proof(State(s): State<AppState>, Path(id): Path<String>, body: Bytes) -> Response {
+    // A re-sent proof (lost response) gets the recorded answer.
     if let Some(f) = s.settled(&id).await {
         return finished_response(f);
     }
-    // The per-upload lock is held while a chunk parses: wait for it on the
-    // blocking pool, not on a runtime worker.
-    let uploads = s.uploads.clone();
-    let lookup_id = id.clone();
-    match tokio::task::spawn_blocking(move || uploads.progress(&lookup_id)).await {
-        Ok(Ok(p)) => Json(p).into_response(),
-        Ok(Err(code)) => error(code),
-        Err(e) => {
-            tracing::error!(upload_id = %id, error = %e, "progress lookup panicked");
-            error(ErrorCode::Unavailable)
-        }
-    }
-}
-
-async fn cancel(State(s): State<AppState>, Path(id): Path<String>) -> StatusCode {
-    if s.uploads.cancel(&id) {
-        m::upload("abandoned");
-        tracing::info!(upload_id = %id, "upload cancelled by the player");
-    }
-    StatusCode::NO_CONTENT
-}
-
-async fn chunk(
-    State(s): State<AppState>,
-    Path((id, offset)): Path<(String, u64)>,
-    body: Body,
-) -> Response {
-    // Cheap refusals first: an unknown upload or a wrong offset never makes
-    // the server buffer a 9 MiB body. A finished upload's re-send still gets
-    // its recorded answer.
-    if let Some(f) = s.settled(&id).await {
-        return finished_response(f);
-    }
-    if let Err(code) = s.uploads.precheck(&id, offset) {
-        return error(code);
-    }
-    let body = match axum::body::to_bytes(body, CHUNK_BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
     // Run to completion even if the client disconnects: a dropped request
     // must not skip the unlock, the metrics or the final-answer record.
-    match tokio::spawn(process_chunk(s, id.clone(), offset, body)).await {
+    match tokio::spawn(process_proof(s, id.clone(), body)).await {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!(upload_id = %id, error = %e, "chunk task failed");
+            tracing::error!(error = %e, "proof task failed");
             error(ErrorCode::Unavailable)
         }
     }
 }
 
-async fn process_chunk(s: AppState, id: String, offset: u64, body: axum::body::Bytes) -> Response {
-    // A re-sent final chunk (lost response) gets the recorded answer, waiting
-    // for a match still in flight; the unlock relay never runs twice.
-    if let Some(f) = s.settled(&id).await {
-        return finished_response(f);
-    }
-    let user_id = s.uploads.user_of(&id);
-    let uploads = s.uploads.clone();
-    let upload_id = id.clone();
-    let step =
-        match tokio::task::spawn_blocking(move || uploads.chunk(&upload_id, offset, &body)).await {
-            Ok(step) => step,
-            Err(e) => {
-                tracing::error!(upload_id = %id, error = %e, "chunk handling panicked");
-                return error(ErrorCode::Unavailable);
-            }
-        };
-    match step {
-        Ok(ChunkStep::Progress(p)) => Json(ChunkResponse::Progress(p)).into_response(),
-        Ok(ChunkStep::Matched { user_id, loaded }) => {
-            // No await between the upload leaving the table and this record,
-            // so a concurrent re-send finds Pending, not NotFound.
-            s.record(&id, Finished::Pending);
+async fn process_proof(s: AppState, id: String, body: Bytes) -> Response {
+    let proved = {
+        let _gate = s.prove_gate.lock().expect("prove gate poisoned");
+        let result = s.challenges.prove(&id, &body);
+        match result {
+            Ok(_) => s.record(&id, Finished::Pending),
+            Err(ErrorCode::WrongFile) => s.record(&id, Finished::WrongFile),
+            Err(_) => {}
+        }
+        result
+    };
+    match proved {
+        Ok(user_id) => {
             let unlocked = unlock_with_retry(&*s.relay, user_id, s.retry_delay).await;
-            let (outcome, label) = match (unlocked, loaded) {
-                (false, _) => (UploadOutcome::UnlockFailed, "unlock_failed"),
-                (true, true) => (UploadOutcome::Loaded, "loaded"),
-                (true, false) => (UploadOutcome::Unlocked, "unlocked"),
+            let (outcome, label) = if unlocked {
+                (ProofOutcome::Unlocked, "unlocked")
+            } else {
+                (ProofOutcome::UnlockFailed, "unlock_failed")
             };
-            if loaded {
-                // The load itself counts even when the unlock then failed.
-                m::upload("loaded");
-            }
-            if label != "loaded" {
-                m::upload(label);
-            }
-            tracing::info!(user_id, upload_id = %id, loaded, label, "upload finished");
+            m::proof(label);
+            tracing::info!(user_id, outcome = label, "proof finished");
             let done = Finished::Done(outcome);
             s.record(&id, done);
             finished_response(done)
         }
+        Err(ErrorCode::WrongFile) => {
+            m::proof("wrong_file");
+            tracing::info!(outcome = "wrong_file", "proof finished");
+            error(ErrorCode::WrongFile)
+        }
+        Err(ErrorCode::ChallengeExpired) => {
+            m::proof("expired");
+            error(ErrorCode::ChallengeExpired)
+        }
         Err(code) => {
-            if code == ErrorCode::WrongFile {
-                m::upload("wrong_file");
-                tracing::info!(?user_id, upload_id = %id, "upload finished: wrong file");
-                s.record(&id, Finished::WrongFile);
-            } else if code == ErrorCode::NotFound {
-                // Lost the race with a concurrent final chunk.
-                if let Some(f) = s.settled(&id).await {
-                    return finished_response(f);
-                }
+            // Lost the race with a concurrent proof for the same challenge.
+            if let Some(f) = s.settled(&id).await {
+                return finished_response(f);
             }
+            m::proof("not_found");
             error(code)
         }
     }
@@ -326,11 +281,11 @@ async fn lookup(
     if !token_matches(provided, &s.internal_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some(index) = s.store.get() else {
+    let Some(dump) = s.store.get() else {
         m::lookup("empty");
         return Json(LookupResponse::Empty).into_response();
     };
-    let found = index.lookup(&word.to_uppercase(), q.glued);
+    let found = dump.index.lookup(&word.to_uppercase(), q.glued);
     m::lookup(if found.is_empty() { "miss" } else { "hit" });
     let definitions = found.iter().map(|d| d.to_string()).collect();
     Json(LookupResponse::Loaded { definitions }).into_response()
@@ -344,7 +299,7 @@ async fn metrics_page(State(s): State<AppState>, headers: HeaderMap) -> Response
     if !token_matches(bearer, &s.metrics_token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    m::set_loaded(s.store.get().map(|i| i.entries()));
+    m::set_loaded(s.store.get().map(|d| d.index.entries()));
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         s.metrics.render(),
