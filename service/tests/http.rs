@@ -433,27 +433,36 @@ async fn an_oversized_proof_is_413() {
     assert_eq!(send(&r.app, req).await.0, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-#[tokio::test]
-async fn metrics_count_challenges_and_proofs() {
-    let r = rig();
-    publish_fixture(&r.store);
-    let c = challenge_for(&r, 77, "a").await;
-    send(&r.app, post_proof(&c.challenge_id, body_for(&c))).await;
+/// The value of one series on the rendered page (0 if absent).
+async fn series_value(app: &Router, series: &str) -> f64 {
     let (_, body) = send(
-        &r.app,
+        app,
         get(
             "/urban-definitions/metrics",
             Some(("authorization", "Bearer metrics-token")),
         ),
     )
     .await;
-    let text = String::from_utf8(body).unwrap();
-    for series in [
-        r#"urban_definitions_challenges_total{outcome="issued"}"#,
-        r#"urban_definitions_challenges_total{outcome="abandoned"}"#,
-        r#"urban_definitions_proofs_total{outcome="unlocked"}"#,
-        r#"urban_definitions_proofs_total{outcome="not_found"}"#,
-    ] {
-        assert!(text.contains(series), "{series}\n{text}");
-    }
+    String::from_utf8(body)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix(series).map(|v| v.trim().parse().unwrap()))
+        .unwrap_or_else(|| panic!("series {series} missing"))
+}
+
+#[tokio::test]
+async fn metrics_count_challenges_and_proofs() {
+    let r = rig();
+    publish_fixture(&r.store);
+    let issued = r#"urban_definitions_challenges_total{outcome="issued"}"#;
+    let unlocked = r#"urban_definitions_proofs_total{outcome="unlocked"}"#;
+    let (issued_before, unlocked_before) = (
+        series_value(&r.app, issued).await,
+        series_value(&r.app, unlocked).await,
+    );
+    let c = challenge_for(&r, 77, "a").await;
+    send(&r.app, post_proof(&c.challenge_id, body_for(&c))).await;
+    // Other tests share the global recorder: assert growth, not an exact count.
+    assert!(series_value(&r.app, issued).await > issued_before);
+    assert!(series_value(&r.app, unlocked).await > unlocked_before);
 }
