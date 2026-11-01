@@ -1,3 +1,4 @@
+pub mod challenges;
 pub mod clock;
 pub mod config;
 pub mod dump;

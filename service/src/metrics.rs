@@ -2,6 +2,16 @@
 
 pub const LOOKUP_RESULTS: [&str; 3] = ["hit", "miss", "empty"];
 
+pub const CHALLENGE_OUTCOMES: [&str; 5] = ["issued", "loading", "bad_ticket", "busy", "abandoned"];
+
+pub const PROOF_OUTCOMES: [&str; 5] = [
+    "unlocked",
+    "unlock_failed",
+    "wrong_file",
+    "expired",
+    "not_found",
+];
+
 pub const LOAD_OUTCOMES: [&str; 4] = ["loaded", "source_error", "wrong_file", "timed_out"];
 
 /// Registers every series at zero so a dashboard sees them before first use.
@@ -11,6 +21,12 @@ pub fn init() {
     }
     for outcome in LOAD_OUTCOMES {
         metrics::counter!("urban_definitions_loads_total", "outcome" => outcome).increment(0);
+    }
+    for outcome in CHALLENGE_OUTCOMES {
+        metrics::counter!("urban_definitions_challenges_total", "outcome" => outcome).increment(0);
+    }
+    for outcome in PROOF_OUTCOMES {
+        metrics::counter!("urban_definitions_proofs_total", "outcome" => outcome).increment(0);
     }
     metrics::gauge!("urban_definitions_last_load_seconds").set(0.0);
     metrics::gauge!("urban_definitions_loaded").set(0.0);
@@ -41,6 +57,14 @@ pub fn record_resident() {
 
 pub fn lookup(result: &'static str) {
     metrics::counter!("urban_definitions_lookups_total", "result" => result).increment(1);
+}
+
+pub fn challenge(outcome: &'static str) {
+    metrics::counter!("urban_definitions_challenges_total", "outcome" => outcome).increment(1);
+}
+
+pub fn proof(outcome: &'static str) {
+    metrics::counter!("urban_definitions_proofs_total", "outcome" => outcome).increment(1);
 }
 
 pub fn load(outcome: &'static str) {

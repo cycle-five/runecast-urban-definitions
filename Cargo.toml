@@ -1,6 +1,6 @@
 [package]
 name = "urban-definitions-wire"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Wire types and ticket signing for the RuneCast urban-definitions service"
 repository = "https://github.com/cycle-five/runecast-urban-definitions"

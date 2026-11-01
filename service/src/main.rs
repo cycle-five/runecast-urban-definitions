@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use urban_definitions_service::challenges::Challenges;
 use urban_definitions_service::clock::SystemClock;
 use urban_definitions_service::config::Config;
 use urban_definitions_service::http::{router, AppState};
@@ -41,7 +42,13 @@ async fn main() -> anyhow::Result<()> {
         &cfg.backend_internal_url,
         cfg.internal_token.clone(),
     )?);
+    let challenges = Arc::new(Challenges::new(
+        cfg.ticket_key.clone().into_bytes(),
+        store.clone(),
+        clock.clone(),
+    ));
     let state = AppState::new(
+        challenges,
         store,
         relay,
         cfg.internal_token,
