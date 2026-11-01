@@ -139,6 +139,7 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Instant) -> Result<usize, L
             Ok(0) => break,
             Ok(n) => got += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(LoadError::TimedOut),
             Err(e) => return Err(LoadError::Source(e)),
         }
     }
