@@ -2,11 +2,17 @@
 
 pub const LOOKUP_RESULTS: [&str; 3] = ["hit", "miss", "empty"];
 
+pub const LOAD_OUTCOMES: [&str; 4] = ["loaded", "source_error", "wrong_file", "timed_out"];
+
 /// Registers every series at zero so a dashboard sees them before first use.
 pub fn init() {
     for result in LOOKUP_RESULTS {
         metrics::counter!("urban_definitions_lookups_total", "result" => result).increment(0);
     }
+    for outcome in LOAD_OUTCOMES {
+        metrics::counter!("urban_definitions_loads_total", "outcome" => outcome).increment(0);
+    }
+    metrics::gauge!("urban_definitions_last_load_seconds").set(0.0);
     metrics::gauge!("urban_definitions_loaded").set(0.0);
     metrics::gauge!("urban_definitions_entries").set(0.0);
     metrics::gauge!("urban_definitions_resident_bytes").set(0.0);
@@ -35,6 +41,14 @@ pub fn record_resident() {
 
 pub fn lookup(result: &'static str) {
     metrics::counter!("urban_definitions_lookups_total", "result" => result).increment(1);
+}
+
+pub fn load(outcome: &'static str) {
+    metrics::counter!("urban_definitions_loads_total", "outcome" => outcome).increment(1);
+}
+
+pub fn set_last_load_seconds(secs: f64) {
+    metrics::gauge!("urban_definitions_last_load_seconds").set(secs);
 }
 
 pub fn set_loaded(entries: Option<usize>) {

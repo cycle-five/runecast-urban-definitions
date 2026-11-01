@@ -4,6 +4,8 @@ pub mod dump;
 pub mod http;
 pub mod index;
 pub mod known;
+pub mod loader;
 pub mod metrics;
 pub mod relay;
+pub mod source;
 pub mod store;
