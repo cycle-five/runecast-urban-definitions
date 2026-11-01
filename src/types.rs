@@ -73,6 +73,30 @@ pub enum ChunkResponse {
     Finished { outcome: UploadOutcome },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeRequest {
+    pub ticket: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Challenge {
+    pub challenge_id: String,
+    pub piece_size: u64,
+    pub pieces: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofOutcome {
+    Unlocked,
+    UnlockFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofResponse {
+    pub outcome: ProofOutcome,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -87,6 +111,8 @@ pub enum ErrorCode {
     ChunkTooLarge,
     WrongFile,
     Unavailable,
+    Loading,
+    ChallengeExpired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,5 +219,38 @@ mod tests {
         check(&ErrorCode::ChunkTooLarge, r#""chunk_too_large""#);
         check(&ErrorCode::WrongFile, r#""wrong_file""#);
         check(&ErrorCode::Unavailable, r#""unavailable""#);
+    }
+
+    #[test]
+    fn challenge_request_and_challenge() {
+        check(
+            &ChallengeRequest { ticket: "t".into() },
+            r#"{"ticket":"t"}"#,
+        );
+        check(
+            &Challenge {
+                challenge_id: "c".into(),
+                piece_size: 4096,
+                pieces: vec![1, 9],
+            },
+            r#"{"challenge_id":"c","piece_size":4096,"pieces":[1,9]}"#,
+        );
+    }
+
+    #[test]
+    fn proof_response() {
+        check(
+            &ProofResponse {
+                outcome: ProofOutcome::Unlocked,
+            },
+            r#"{"outcome":"unlocked"}"#,
+        );
+        check(&ProofOutcome::UnlockFailed, r#""unlock_failed""#);
+    }
+
+    #[test]
+    fn new_error_codes() {
+        check(&ErrorCode::Loading, r#""loading""#);
+        check(&ErrorCode::ChallengeExpired, r#""challenge_expired""#);
     }
 }

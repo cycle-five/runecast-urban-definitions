@@ -161,6 +161,8 @@ fn status_of(code: ErrorCode) -> StatusCode {
         ErrorCode::Busy => StatusCode::CONFLICT,
         ErrorCode::TooManyUploads => StatusCode::TOO_MANY_REQUESTS,
         ErrorCode::Unavailable => StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Loading => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::ChallengeExpired => StatusCode::GONE,
     }
 }
 
