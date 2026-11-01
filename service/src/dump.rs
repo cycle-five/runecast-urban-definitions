@@ -43,16 +43,14 @@ impl ProofTable {
         Some(self.piece_size.min(self.size - i * self.piece_size))
     }
 
-    /// Whether the first `piece_len(i)` bytes of `bytes` hash to piece `i`.
-    /// False if `i` is out of range or `bytes` is shorter than the piece.
+    /// Whether `bytes` is exactly piece `i`. False if `i` is out of range or
+    /// `bytes` is not exactly `piece_len(i)` long.
     pub fn matches(&self, i: u64, bytes: &[u8]) -> bool {
         let Some(len) = self.piece_len(i) else {
             return false;
         };
-        match bytes.get(..len as usize) {
-            Some(piece) => <[u8; 32]>::from(Sha256::digest(piece)) == self.hashes[i as usize],
-            None => false,
-        }
+        bytes.len() as u64 == len
+            && <[u8; 32]>::from(Sha256::digest(bytes)) == self.hashes[i as usize]
     }
 }
 
@@ -252,8 +250,17 @@ mod tests {
         assert_eq!(d.proof.piece_len(134), Some(8610 - 134 * 64));
         assert_eq!(d.proof.piece_len(135), None);
         for i in 0..135u64 {
-            assert!(d.proof.matches(i, &FIXTURE[(i * 64) as usize..]), "{i}");
+            let start = (i * 64) as usize;
+            let end = ((i as usize + 1) * 64).min(FIXTURE.len());
+            assert!(d.proof.matches(i, &FIXTURE[start..end]), "{i}");
+            assert!(!d.proof.matches(i, &FIXTURE[start..end - 1]), "short {i}");
+            if end < FIXTURE.len() {
+                assert!(!d.proof.matches(i, &FIXTURE[start..end + 1]), "long {i}");
+            }
         }
+        let mut longer = FIXTURE[134 * 64..].to_vec();
+        longer.push(0);
+        assert!(!d.proof.matches(134, &longer));
         assert!(!d.proof.matches(0, &FIXTURE[1..]));
         assert!(!d.proof.matches(135, FIXTURE));
     }
